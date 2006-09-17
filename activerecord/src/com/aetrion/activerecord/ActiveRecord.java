@@ -4,23 +4,30 @@ import com.aetrion.activerecord.adapter.Adapter;
 import com.aetrion.activerecord.adapter.Column;
 import com.aetrion.activerecord.adapter.Row;
 import com.aetrion.activerecord.annotations.PrimaryKey;
+import com.aetrion.activerecord.annotations.Sequence;
 import com.aetrion.activerecord.annotations.aggregations.ComposedOf;
 import com.aetrion.activerecord.annotations.associations.BelongsTo;
 import com.aetrion.activerecord.annotations.associations.HasAndBelongsToMany;
 import com.aetrion.activerecord.annotations.associations.HasMany;
 import com.aetrion.activerecord.annotations.associations.HasOne;
-import com.aetrion.activerecord.annotations.callbacks.*;
+import com.aetrion.activerecord.annotations.validations.Validate;
+import com.aetrion.activerecord.annotations.validations.ValidatesPresenceOf;
 import com.aetrion.activerecord.association.AssociationProxy;
 import com.aetrion.activerecord.association.HasManyProxy;
+import com.aetrion.activerecord.callbacks.CallbackType;
+import com.aetrion.activerecord.errors.ActiveRecordException;
+import com.aetrion.activerecord.errors.IllegalAnnotationException;
 import com.aetrion.activerecord.errors.ReadOnlyException;
 import com.aetrion.activerecord.errors.RecordNotFoundException;
-import com.aetrion.activerecord.errors.IllegalAnnotationException;
 import com.aetrion.activerecord.validations.ValidationErrors;
+import com.aetrion.activerecord.validations.Validator;
 import com.aetrion.activesupport.Classes;
 import com.aetrion.activesupport.Strings;
 
 import java.lang.annotation.Annotation;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.*;
 
@@ -57,6 +64,14 @@ public abstract class ActiveRecord {
     private List<Column> columns;
 
     private List<AssociationProxy> associationProxies = new ArrayList<AssociationProxy>();
+    private Map<CallbackType, List<Method>> callbacks = new HashMap<CallbackType, List<Method>>();
+    private List<Validator> validators = new ArrayList<Validator>();
+
+    public ActiveRecord() {
+        readCallbacks();
+        readValidations();
+        readOtherAnnotations();
+    }
 
     // accessors
 
@@ -221,9 +236,10 @@ public abstract class ActiveRecord {
             String name = column.getName();
             Classes.setFieldValue(this, name, row.get(name));
         }
+
         readAssociations();
         readAggregations();
-        readCallbacks();
+
         newRecord = false;
         return this;
     }
@@ -233,6 +249,15 @@ public abstract class ActiveRecord {
      * @return The primary key
      */
     public Object create() {
+        executeCallbacks(CallbackType.BEFORE_CREATE);
+
+        executeCallbacks(CallbackType.BEFORE_VALIDATION);
+        executeValidations();
+        executeValidationsOnCreate();
+        executeCallbacks(CallbackType.AFTER_VALIDATION);
+
+        if (errors.size() > 0) return this;
+
         Adapter adapter = getAdapter();
         if (getId() == null && adapter.shouldPrefetchPrimaryKey(getTableName())) {
             this.id = adapter.getNextSequenceValue(getSequenceName());
@@ -247,9 +272,10 @@ public abstract class ActiveRecord {
 
         readAssociations();
         readAggregations();
-        readCallbacks();
 
         newRecord = false;
+
+        executeCallbacks(CallbackType.AFTER_CREATE);
 
         return id;
     }
@@ -259,6 +285,14 @@ public abstract class ActiveRecord {
      * @return True if the object was updated
      */
     public boolean update() {
+        executeCallbacks(CallbackType.BEFORE_UPDATE);
+
+        executeCallbacks(CallbackType.BEFORE_VALIDATION);
+        executeValidations();
+        executeValidationsOnUpdate();
+        if (errors.size() > 0) return false;
+        executeCallbacks(CallbackType.AFTER_VALIDATION);
+
         Adapter adapter = getAdapter();
         StringBuilder sql = new StringBuilder();
         sql.append("UPDATE ").append(getTableName());
@@ -269,27 +303,27 @@ public abstract class ActiveRecord {
         if (result) {
             reloadAssociations();
             reloadAggregations();
-            reloadCallbacks();
         }
+
+        executeCallbacks(CallbackType.AFTER_UPDATE);
         return result;
     }
 
-    public boolean updateAttributes(Map<String,Object> attributes) {
-        for (Map.Entry<String,Object> entry : attributes.entrySet()) {
+    public boolean updateAttributes(Map<String, Object> attributes) {
+        for (Map.Entry<String, Object> entry : attributes.entrySet()) {
             Classes.setFieldValue(this, entry.getKey(), entry.getValue());
         }
         return save();
     }
 
-    /**
-     * Create or update depending on whether or not the record is new.
-     */
-    void createOrUpdate() {
+    /** Create or update depending on whether or not the record is new. */
+    Object createOrUpdate() {
         if (isNewRecord()) {
             create();
         } else {
             update();
         }
+        return this;
     }
 
     /**
@@ -297,8 +331,10 @@ public abstract class ActiveRecord {
      * @return True if the save succeeded
      */
     public boolean save() {
+        executeCallbacks(CallbackType.BEFORE_SAVE);
         if (readOnly) throw new ReadOnlyException(getClass().getName() + " is read only");
         createOrUpdate();
+        executeCallbacks(CallbackType.AFTER_SAVE);
         return true;
     }
 
@@ -307,6 +343,7 @@ public abstract class ActiveRecord {
      * @return True if the record was destroyed
      */
     public boolean destroy() {
+        executeCallbacks(CallbackType.BEFORE_DESTROY);
         Adapter adapter = getAdapter();
         StringBuilder sql = new StringBuilder();
         sql.append("DELETE FROM ");
@@ -315,7 +352,14 @@ public abstract class ActiveRecord {
         sql.append(getPrimaryKey());
         sql.append(" = ");
         sql.append(adapter.quote(attribute(getPrimaryKey())));
-        return adapter.execute(sql.toString(), getClass().getName() + " Destroy") == new Integer(1);
+        boolean destroyed = adapter.execute(sql.toString(), getClass().getName() + " Destroy") == new Integer(1);
+        executeCallbacks(CallbackType.AFTER_DESTROY);
+        return destroyed;
+    }
+
+    /** Validation method which can be overriden in subclasses. Default behavior is no op. */
+    protected void validate() {
+        // no op
     }
 
     /**
@@ -404,6 +448,11 @@ public abstract class ActiveRecord {
         return sb.toString();
     }
 
+    /**
+     * Get the column instance for the named attribute.
+     * @param name The name of the attribute
+     * @return The Column instance of null
+     */
     Column getColumnForAttribute(String name) {
         name = Strings.underscore(name);
         for (Column column : getColumns()) {
@@ -422,6 +471,16 @@ public abstract class ActiveRecord {
             String name = column.getName();
             Object value = row.get(name);
             Classes.setFieldValue(this, name, value);
+        }
+    }
+
+    void readOtherAnnotations() {
+        Class c = getClass();
+        for (Annotation a : c.getAnnotations()) {
+            if (a.annotationType().equals(Sequence.class)) {
+                Sequence sequence = (Sequence) a;
+                setSequenceName(sequence.value());
+            }
         }
     }
 
@@ -479,28 +538,107 @@ public abstract class ActiveRecord {
     }
 
     void readCallbacks() {
+        System.out.println("Reading callbacks");
         Class c = getClass();
-        for (Field f : c.getDeclaredFields()) {
-            for (Annotation a : f.getDeclaredAnnotations()) {
-                if (a.annotationType().equals(AfterCreate.class)) {
-                    // TODO implement
-                } else if (a.annotationType().equals(AfterDestroy.class)) {
-                    // TODO implement
-                } else if (a.annotationType().equals(AfterFind.class)) {
-                    // TODO implement
-                } else if (a.annotationType().equals(AfterInitialization.class)) {
-                    // TODO implement
-                } else if (a.annotationType().equals(BeforeCreate.class)) {
-                    // TODO implement
-                } else if (a.annotationType().equals(BeforeDestroy.class)) {
-                    // TODO implement
+        for (Method m : c.getDeclaredMethods()) {
+            System.out.println("Finding annotations for method " + m);
+            for (Annotation a : m.getDeclaredAnnotations()) {
+                CallbackType callbackType = CallbackType.callbackTypeMap.get(a.annotationType());
+                if (callbackType != null) {
+                    List<Method> methods = callbacks.get(callbackType);
+                    if (methods == null) {
+                        methods = new ArrayList<Method>();
+                        callbacks.put(callbackType, methods);
+                    }
+                    methods.add(m);
                 }
             }
         }
     }
 
     void reloadCallbacks() {
+        callbacks = new HashMap<CallbackType, List<Method>>();
         readCallbacks();
+    }
+
+    void readValidations() {
+        Class c = getClass();
+
+        Map<Class, Class> validationTypeMap = new HashMap<Class, Class>();
+        validationTypeMap.put(ValidatesPresenceOf.class,
+                com.aetrion.activerecord.validations.ValidatesPresenceOf.class);
+
+        // handle class-level validation annotations
+        for (Annotation a : c.getDeclaredAnnotations()) {
+            if (a.getClass().equals(Validate.class)) {
+
+            }
+        }
+
+        // handle field-level validation annotations
+        for (Field f : c.getDeclaredFields()) {
+            for (Annotation a : f.getDeclaredAnnotations()) {
+                try {
+                    Class validatorClass = validationTypeMap.get(a.getClass());
+                    validators.add((Validator) validatorClass.newInstance());
+                } catch (InstantiationException e) {
+                    throw new ActiveRecordException(e);
+                } catch (IllegalAccessException e) {
+                    throw new ActiveRecordException(e);
+                }
+            }
+        }
+    }
+
+    void reloadValidations() {
+        readValidations();
+    }
+
+    /**
+     * Execute the registered callbacks for the specified type.
+     * @param callbackType The callback type
+     */
+    void executeCallbacks(CallbackType callbackType) {
+        System.out.println("Executing callbacks: " + callbackType);
+        List<Method> methods = callbacks.get(callbackType);
+        if (methods == null) return;
+        for (Method m : methods) {
+            try {
+                m.setAccessible(true);
+                m.invoke(this);
+            } catch (IllegalAccessException e) {
+                throw new ActiveRecordException(e);
+            } catch (InvocationTargetException e) {
+                throw new ActiveRecordException(e);
+            } finally {
+                m.setAccessible(false);
+            }
+        }
+    }
+
+    /**
+     * Execute validations.
+     */
+    void executeValidations() {
+        executeCallbacks(CallbackType.BEFORE_VALIDATION);
+
+        // execute the validate method first
+        validate();
+
+        // execute validators added on with annotations
+        for (Validator v : validators) {
+            v.validate();
+        }
+
+        executeCallbacks(CallbackType.AFTER_VALIDATION);
+    }
+
+    void executeValidationsOnCreate() {
+
+    }
+
+    void executeValidationsOnUpdate() {
+        
     }
 
 }
