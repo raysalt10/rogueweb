@@ -1,0 +1,1 @@
+Port of some or all of Rails to Java. Naturally some of the functionality cannot possibly be ported as is due to language differences between Java and Ruby, but the concepts are portable in many cases.
